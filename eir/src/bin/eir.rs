@@ -2,51 +2,83 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 
+use core::cell::RefCell;
+
 use defmt::*;
 use eir::microros;
 use eir::microros::Allocator;
 use eir::microros::RclNode;
-use eir::microros::RclPublisher;
-use eir::microros::RclService;
-use eir::microros::RclServiceClient;
-use eir::microros::RclSubscription;
 use eir::microros::RclcExecutor;
 use eir::microros::RclcSupport;
+use eir::microros::TypedPublisher;
+use eir::msg::BatteryState;
+use eir::msg::Empty;
 use eir::smartled::Ws2812;
 use embassy_executor::InterruptExecutor;
 use embassy_executor::Spawner;
 use embassy_futures::yield_now;
+use embassy_rp::adc::Adc;
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio;
+use embassy_rp::gpio::AnyPin;
+use embassy_rp::gpio::Input;
+use embassy_rp::gpio::Pin;
 use embassy_rp::interrupt;
 use embassy_rp::interrupt::InterruptExt as _;
 use embassy_rp::interrupt::Priority;
 use embassy_rp::pio::Pio;
 use embassy_rp::Peripherals;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::CriticalSectionMutex;
 use embassy_sync::channel;
 use embassy_sync::channel::Channel;
+use embassy_time::Instant;
 use embassy_time::Timer;
 use gpio::{Level, Output};
-use microros_sys::rosidl_typesupport_c__get_message_type_support_handle__std_msgs__msg__ColorRGBA;
-use microros_sys::rosidl_typesupport_c__get_message_type_support_handle__std_msgs__msg__Int32;
-use microros_sys::rosidl_typesupport_c__get_service_type_support_handle__std_srvs__srv__SetBool;
-use microros_sys::std_msgs__msg__ColorRGBA;
-use microros_sys::std_msgs__msg__ColorRGBA__create;
-use microros_sys::std_srvs__srv__SetBool_Request;
-use microros_sys::std_srvs__srv__SetBool_Request__create;
-use microros_sys::std_srvs__srv__SetBool_Response;
-use microros_sys::std_srvs__srv__SetBool_Response__create;
+use microros_sys::builtin_interfaces__msg__Time;
 use smart_leds::RGB8;
 use static_cell::make_static;
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
+    ADC_IRQ_FIFO => embassy_rp::adc::InterruptHandler;
 });
 
+struct TimestampedValue<T> {
+    value: T,
+    timestamp: Instant,
+}
+
+impl<T> TimestampedValue<T>
+where
+    T: Copy,
+{
+    pub fn new(value: T) -> Self {
+        Self {
+            value,
+            timestamp: Instant::now(),
+        }
+    }
+
+    pub fn set(&mut self, value: T) {
+        self.value = value;
+        self.timestamp = Instant::now();
+    }
+
+    pub fn get(&self) -> (T, Instant) {
+        (self.value, self.timestamp)
+    }
+}
+
+struct State {
+    battery_voltage: TimestampedValue<f32>,
+}
+
+type SharedState = CriticalSectionMutex<RefCell<State>>;
+
 #[embassy_executor::task]
-async fn run_embassy(p: Peripherals) {
+async fn run_embassy(p: Peripherals, state: &'static SharedState) {
     defmt::info!("hello");
     let spawner = Spawner::for_current_executor().await;
 
@@ -60,12 +92,49 @@ async fn run_embassy(p: Peripherals) {
 
     unwrap!(spawner.spawn(smartled_task(ws2812, SMARTLED_CHANNEL.receiver())));
 
+    let button = Input::new(p.PIN_18.degrade(), gpio::Pull::Up);
+    unwrap!(spawner.spawn(shutdown_button_task(button)));
+
+    let adc = Adc::new(p.ADC, Irqs, embassy_rp::adc::Config::default());
+    let battery_voltage_channel = embassy_rp::adc::Channel::new_pin(p.PIN_26, gpio::Pull::None);
+
+    unwrap!(spawner.spawn(battery_voltage_measurement_task(
+        adc,
+        battery_voltage_channel,
+        state
+    )));
+
     let mut led = Output::new(p.PIN_20, Level::Low);
     loop {
         led.set_high();
         Timer::after_millis(300).await;
         led.set_low();
         Timer::after_millis(300).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn shutdown_button_task(mut button: Input<'static, AnyPin>) {
+    let sender = SHUTDOWN_CHANNEL.sender();
+    loop {
+        button.wait_for_falling_edge().await;
+        // TODO: better debounce?
+        Timer::after_millis(100).await;
+        sender.send(()).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn battery_voltage_measurement_task(
+    mut adc: Adc<'static, embassy_rp::adc::Async>,
+    mut channel: embassy_rp::adc::Channel<'static>,
+    state: &'static SharedState,
+) {
+    loop {
+        let value = adc.read(&mut channel).await.unwrap_or(0) as f32;
+        let voltage = value / 4096.0 * 3.3;
+        state.lock(|c| c.borrow_mut().battery_voltage.set(voltage));
+        Timer::after_millis(100).await;
     }
 }
 
@@ -95,10 +164,13 @@ unsafe fn SWI_IRQ_0() {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+    let state = make_static!(CriticalSectionMutex::new(RefCell::new(State {
+        battery_voltage: TimestampedValue::new(0.0)
+    })));
 
     interrupt::SWI_IRQ_0.set_priority(Priority::P3);
     let embassy_spawner = EXECUTOR_EMBASSY.start(interrupt::SWI_IRQ_0);
-    unwrap!(embassy_spawner.spawn(run_embassy(p)));
+    unwrap!(embassy_spawner.spawn(run_embassy(p, state)));
 
     Timer::after_secs(1).await;
 
@@ -109,54 +181,15 @@ async fn main(spawner: Spawner) {
     microros::wait_for_agent();
 
     let mut support = RclcSupport::new(&mut allocator);
-    let mut node = RclNode::new("pico_node", "", &mut support);
-    let publisher = RclPublisher::new(
-        &mut node,
-        unsafe { rosidl_typesupport_c__get_message_type_support_handle__std_msgs__msg__Int32() },
-        "pico_publisher",
-    );
-    defmt::unwrap!(spawner.spawn(publisher_task(publisher)));
+    let mut node = RclNode::new("hati_eir_node", "hati", &mut support);
+    let battery_publisher = TypedPublisher::new(&mut node, "battery");
+    defmt::unwrap!(spawner.spawn(battery_publisher_task(battery_publisher, state)));
 
-    let mut subscription = RclSubscription::new(
-        &mut node,
-        unsafe {
-            rosidl_typesupport_c__get_message_type_support_handle__std_msgs__msg__ColorRGBA()
-        },
-        "pico_sub",
-    );
+    let shutdown_publisher = TypedPublisher::<Empty>::new(&mut node, "cmd_shutdown");
+
+    defmt::unwrap!(spawner.spawn(shutdown_publisher_task(shutdown_publisher)));
 
     let mut executor = RclcExecutor::new(&mut support, 10, &mut allocator);
-
-    let sub_data = unsafe { std_msgs__msg__ColorRGBA__create() };
-
-    executor.add_subscription(&mut subscription, sub_data as _, Some(sub_callback));
-
-    let mut service = RclService::new(
-        &mut node,
-        unsafe { rosidl_typesupport_c__get_service_type_support_handle__std_srvs__srv__SetBool() },
-        "pico_srv",
-    );
-
-    executor.add_service(
-        &mut service,
-        unsafe { std_srvs__srv__SetBool_Request__create() as _ },
-        unsafe { std_srvs__srv__SetBool_Response__create() as _ },
-        Some(service_callback),
-    );
-
-    let mut service_client = RclServiceClient::new(
-        &mut node,
-        unsafe { rosidl_typesupport_c__get_service_type_support_handle__std_srvs__srv__SetBool() },
-        "hello_srv",
-    );
-
-    executor.add_service_client(
-        &mut service_client,
-        unsafe { std_srvs__srv__SetBool_Response__create() as _ },
-        Some(service_client_callback),
-    );
-
-    defmt::unwrap!(spawner.spawn(service_client_task(service_client)));
 
     loop {
         yield_now().await;
@@ -164,59 +197,44 @@ async fn main(spawner: Spawner) {
     }
 }
 
-extern "C" fn service_client_callback(resp: *const core::ffi::c_void) {
-    defmt::warn!("recv");
-    defmt::assert!(!resp.is_null());
-    defmt::assert!(resp.is_aligned());
-    let resp = resp as *const std_srvs__srv__SetBool_Response;
-    let resp: &std_srvs__srv__SetBool_Response = unsafe { &*resp as _ };
-
-    defmt::error!("received response: {}", resp.success);
-}
+static SHUTDOWN_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 
 #[embassy_executor::task]
-async fn service_client_task(mut client: RclServiceClient) {
-    let sqn = make_static!(0i64);
-    let mut req = std_srvs__srv__SetBool_Request { data: false };
-
+async fn shutdown_publisher_task(mut publisher: TypedPublisher<Empty>) {
+    let message = Empty::default();
+    let receiver = SHUTDOWN_CHANNEL.receiver();
     loop {
-        Timer::after_secs(1).await;
-        let r: *const std_srvs__srv__SetBool_Request = &req as _;
-        client.send_request(r as _, sqn);
-        defmt::warn!("req sent");
-        req.data = !req.data;
+        receiver.receive().await;
+        publisher.publish(&message);
     }
 }
 
-extern "C" fn service_callback(req: *const core::ffi::c_void, resp: *mut core::ffi::c_void) {
-    defmt::assert!(!req.is_null());
-    defmt::assert!(req.is_aligned());
-    let req = req as *const std_srvs__srv__SetBool_Request;
-    let req: &std_srvs__srv__SetBool_Request = unsafe { &(*req) };
-    defmt::error!("service call: {}", req.data);
-
-    defmt::assert!(!resp.is_null());
-    defmt::assert!(resp.is_aligned());
-    let resp = resp as *mut std_srvs__srv__SetBool_Response;
-    let resp: &mut std_srvs__srv__SetBool_Response = unsafe { &mut (*resp) };
-    resp.success = true;
-}
-
-extern "C" fn sub_callback(data: *const core::ffi::c_void) {
-    let real = data as *const std_msgs__msg__ColorRGBA;
-    let r = (unsafe { (*real).r } * 255.0) as u8;
-    let g = (unsafe { (*real).g } * 255.0) as u8;
-    let b = (unsafe { (*real).b } * 255.0) as u8;
-    let _ = SMARTLED_CHANNEL.try_send(RGB8 { r, g, b });
-    defmt::error!("received: {}", r);
-}
-
 #[embassy_executor::task]
-async fn publisher_task(mut publisher: RclPublisher) {
-    let mut a = 0;
+async fn battery_publisher_task(
+    mut publisher: TypedPublisher<BatteryState>,
+    state: &'static SharedState,
+) {
+    let mut message = BatteryState::default();
     loop {
         Timer::after_millis(1000).await;
-        publisher.publish(a);
-        a += 1;
+        publisher.publish(&message);
+        let (voltage, timestamp) = state.lock(|c| c.borrow().battery_voltage.get());
+        message.voltage = voltage;
+        message.header.stamp = timestamp.stamp();
+    }
+}
+
+trait InstantExt {
+    fn stamp(&self) -> builtin_interfaces__msg__Time;
+}
+
+impl InstantExt for Instant {
+    fn stamp(&self) -> builtin_interfaces__msg__Time {
+        let now = self.as_micros();
+
+        builtin_interfaces__msg__Time {
+            sec: (now / 1_000_000) as _,
+            nanosec: (now % 1_000_000) as _,
+        }
     }
 }

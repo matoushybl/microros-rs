@@ -1,4 +1,4 @@
-use core::{mem::MaybeUninit, ptr};
+use core::{marker::PhantomData, mem::MaybeUninit, ptr};
 
 use microros_sys::{
     rcl_client_t, rcl_context_t, rcl_node_t, rcl_publish, rcl_publisher_t, rcl_send_request,
@@ -123,6 +123,27 @@ impl RclPublisher {
 
     pub fn publish(&mut self, data: *const core::ffi::c_void) {
         unsafe { rcl_publish(self.as_mut_ptr(), data, core::ptr::null_mut()) };
+    }
+}
+
+pub struct TypedPublisher<T> {
+    _phantom: PhantomData<T>,
+    inner: RclPublisher,
+}
+
+impl<T> TypedPublisher<T>
+where
+    T: crate::msg::Message,
+{
+    pub fn new(node: &mut RclNode, topic_name: &str) -> Self {
+        Self {
+            _phantom: PhantomData,
+            inner: RclPublisher::new(node, unsafe { T::rosidl_type_support() }, topic_name),
+        }
+    }
+
+    pub fn publish(&mut self, msg: &T) {
+        self.inner.publish(msg.erased_ptr())
     }
 }
 
